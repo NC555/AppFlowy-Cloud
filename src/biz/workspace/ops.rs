@@ -57,9 +57,6 @@ pub async fn delete_workspace_for_user(
   // remove from postgres
   delete_from_workspace(&pg_pool, &workspace_id).await?;
 
-  // TODO: There can be a rare case where user uploads while workspace is being deleted.
-  // We need some routine job to clean up these orphaned files.
-
   Ok(())
 }
 
@@ -543,6 +540,14 @@ pub async fn remove_workspace_members(
       workspace_access_control
         .remove_user_from_workspace(&uid, workspace_id)
         .await?;
+
+      // TODO: Add permission cache invalidation for removed user
+      // if let Some(realtime_server) = get_realtime_server_handle() {
+      //   realtime_server.send_to_workspace(
+      //     *workspace_id,
+      //     InvalidateUserPermissions { uid }
+      //   ).await;
+      // }
     }
   }
 
@@ -556,8 +561,8 @@ pub async fn remove_workspace_members(
 pub async fn get_workspace_members(
   pg_pool: &PgPool,
   workspace_id: &Uuid,
-) -> Result<Vec<AFWorkspaceMemberRow>, AppResponseError> {
-  Ok(select_workspace_member_list(pg_pool, workspace_id).await?)
+) -> Result<Vec<AFWorkspaceMemberRow>, AppError> {
+  select_workspace_member_list(pg_pool, workspace_id).await
 }
 
 pub async fn get_workspace_member(

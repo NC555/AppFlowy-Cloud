@@ -19,10 +19,11 @@ use crate::biz::workspace::ops::{
 };
 use crate::biz::workspace::page_view::{
   add_recent_pages, append_block_at_the_end_of_page, create_database_view, create_folder_view,
-  create_page, create_space, delete_all_pages_from_trash, delete_trash, favorite_page,
-  get_page_view_collab, move_page, move_page_to_trash, publish_page, reorder_favorite_page,
-  restore_all_pages_from_trash, restore_page_from_trash, unpublish_page, update_page,
-  update_page_collab_data, update_page_extra, update_page_icon, update_page_name, update_space,
+  create_orphaned_view, create_page, create_space, delete_all_pages_from_trash, delete_trash,
+  favorite_page, get_page_view_collab, move_page, move_page_to_trash, publish_page,
+  reorder_favorite_page, restore_all_pages_from_trash, restore_page_from_trash, unpublish_page,
+  update_page, update_page_collab_data, update_page_extra, update_page_icon, update_page_name,
+  update_space,
 };
 use crate::biz::workspace::publish::get_workspace_default_publish_view_info_meta;
 use crate::biz::workspace::quick_note::{
@@ -45,7 +46,7 @@ use appflowy_collaborate::actix_ws::entities::{
 
 use bytes::BytesMut;
 use chrono::{DateTime, Duration, Utc};
-use collab::core::collab::DataSource;
+use collab::core::collab::{default_client_id, CollabOptions, DataSource};
 use collab::core::origin::CollabOrigin;
 use collab::entity::EncodedCollab;
 use collab::preclude::Collab;
@@ -264,6 +265,10 @@ pub fn workspace_scope() -> Scope {
     .service(
       web::resource("/{workspace_id}/page-view/{view_id}/unpublish")
         .route(web::post().to(unpublish_page_handler)),
+    )
+    .service(
+      web::resource("/{workspace_id}/orphaned-view")
+        .route(web::post().to(post_orphaned_view_handler)),
     )
     .service(
       web::resource("/{workspace_id}/batch/collab")
@@ -629,6 +634,8 @@ async fn post_workspace_settings_handler(
   Ok(AppResponse::Ok().with_data(settings).into())
 }
 
+/// A workspace member/owner can view all members of the workspace, except for guests.
+/// A guest can only view their own information.
 #[instrument(skip_all, err)]
 async fn get_workspace_members_handler(
   user_uuid: UserUuid,
@@ -639,19 +646,19 @@ async fn get_workspace_members_handler(
   let workspace_id = workspace_id.into_inner();
   state
     .workspace_access_control
-    .enforce_role(&uid, &workspace_id, AFRole::Member)
+    .enforce_role(&uid, &workspace_id, AFRole::Guest)
     .await?;
-  let members = workspace::ops::get_workspace_members(&state.pg_pool, &workspace_id)
-    .await?
-    .into_iter()
-    .map(|member| AFWorkspaceMember {
-      name: member.name,
-      email: member.email,
-      role: member.role,
-      avatar_url: member.avatar_url,
-      joined_at: member.created_at,
-    })
-    .collect();
+  let requester_member_info =
+    workspace::ops::get_workspace_member(&uid, &state.pg_pool, &workspace_id).await?;
+  let members: Vec<AFWorkspaceMember> = if requester_member_info.role == AFRole::Guest {
+    vec![requester_member_info.into()]
+  } else {
+    workspace::ops::get_workspace_members(&state.pg_pool, &workspace_id)
+      .await?
+      .into_iter()
+      .map(|member| member.into())
+      .collect()
+  };
 
   Ok(AppResponse::Ok().with_data(members).into())
 }
@@ -972,18 +979,14 @@ async fn batch_create_collab_handler(
         let compressed_data = &payload_buffer[offset..offset + len];
         match decompress(compressed_data.to_vec(), buffer_size) {
           Ok(decompressed_data) => {
-            let params = CollabParams::from_bytes(&decompressed_data).ok()?;
+            let params = CreateCollabData::from_bytes(&decompressed_data).ok()?;
+            let params = CollabParams::from(params);
             if params.validate().is_ok() {
               let encoded_collab =
                 EncodedCollab::decode_from_bytes(&params.encoded_collab_v1).ok()?;
-              let collab = Collab::new_with_source(
-                CollabOrigin::Empty,
-                &params.object_id.to_string(),
-                DataSource::DocStateV1(encoded_collab.doc_state.to_vec()),
-                vec![],
-                false,
-              )
-              .ok()?;
+              let options = CollabOptions::new(params.object_id.to_string(), default_client_id())
+                .with_data_source(DataSource::DocStateV1(encoded_collab.doc_state.to_vec()));
+              let collab = Collab::new_with_options(CollabOrigin::Empty, options).ok()?;
 
               match params.collab_type.validate_require_data(&collab) {
                 Ok(_) => {
@@ -1170,7 +1173,7 @@ async fn get_collab_json_handler(
     .await
     .map_err(AppResponseError::from)?
     .doc_state;
-  let collab = collab_from_doc_state(doc_state.to_vec(), &object_id)?;
+  let collab = collab_from_doc_state(doc_state.to_vec(), &object_id, default_client_id())?;
 
   let resp = CollabJsonResponse {
     collab: collab.to_json_value(),
@@ -1327,6 +1330,25 @@ async fn post_page_view_handler(
   )
   .await?;
   Ok(Json(AppResponse::Ok().with_data(page)))
+}
+
+async fn post_orphaned_view_handler(
+  user_uuid: UserUuid,
+  path: web::Path<Uuid>,
+  payload: Json<CreateOrphanedViewParams>,
+  state: Data<AppState>,
+) -> Result<Json<AppResponse<()>>> {
+  let uid = state.user_cache.get_user_uid(&user_uuid).await?;
+  let workspace_uuid = path.into_inner();
+  create_orphaned_view(
+    uid,
+    &state.pg_pool,
+    &state.collab_access_control_storage,
+    workspace_uuid,
+    payload.document_id,
+  )
+  .await?;
+  Ok(Json(AppResponse::Ok()))
 }
 
 async fn append_block_to_page_handler(
